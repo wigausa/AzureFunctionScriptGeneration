@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
@@ -9,7 +10,7 @@ from typing import Any, Callable, Dict, Optional
 import azure.functions as func
 import requests
 from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_blob_sas
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 from utils.templates.GV import create_script as create_gv_script
 from utils.templates.GVC import create_script as create_gvc_script
@@ -40,6 +41,17 @@ SCRIPT_GENERATORS: Dict[str, Dict[str, Any]] = {
         "generator": create_rs_script,
     },
 }
+
+
+def _trace_log(operation_id: str, action: str, status: str, **fields: Any) -> None:
+    payload: Dict[str, Any] = {
+        "operationId": operation_id,
+        "action": action,
+        "status": status,
+        "timestampUtc": datetime.now(timezone.utc).isoformat(),
+    }
+    payload.update(fields)
+    logging.info(json.dumps(payload, ensure_ascii=False))
 
 def _get_body_param(req: func.HttpRequest, key: str) -> str:
     try:
@@ -148,12 +160,49 @@ def _set_blob_metadata(container_name: str, blob_name: str, metadata: Dict[str, 
     blob_client.set_blob_metadata(metadata=metadata)
 
 
-def _sanitize_metadata_value(value: str, max_len: int = 512) -> str:
-    clean = " ".join(str(value).replace("\n", " ").replace("\r", " ").split())
-    return clean[:max_len]
+def _find_blob_by_schedule(report_code: str, id_reporte: str, id_schedule: str) -> Optional[Dict[str, Any]]:
+    connection_string = _get_blob_connection_string()
+    container_name = os.getenv("SCRIPT_BLOB_CONTAINER", "generated-scripts")
+
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    container_client = blob_service_client.get_container_client(container_name)
+
+    blobs = container_client.list_blobs(name_starts_with=f"{report_code}/", include=["metadata"])
+    for blob in blobs:
+        metadata = blob.metadata or {}
+        if metadata.get("id_schedule") == id_schedule and metadata.get("id_reporte") == id_reporte:
+            return {
+                "container": container_name,
+                "blobName": blob.name,
+                "blobUrl": container_client.get_blob_client(blob.name).url,
+                "metadata": metadata,
+            }
+    return None
 
 
-def _generate_and_publish_script(id_reporte: str, id_schedule: str, cron_expression: str) -> Dict[str, Any]:
+def _delete_blob(container_name: str, blob_name: str) -> Dict[str, Any]:
+    connection_string = _get_blob_connection_string()
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+
+    try:
+        blob_client.delete_blob(delete_snapshots="include")
+        return {
+            "status": "deleted",
+            "container": container_name,
+            "blobName": blob_name,
+            "blobUrl": blob_client.url,
+        }
+    except ResourceNotFoundError:
+        return {
+            "status": "not_found",
+            "container": container_name,
+            "blobName": blob_name,
+            "blobUrl": blob_client.url,
+        }
+
+
+def _get_artifact_names(id_reporte: str, id_schedule: str) -> Dict[str, Any]:
     mapping = SCRIPT_GENERATORS.get(id_reporte)
     if not mapping:
         raise ValueError(
@@ -166,6 +215,27 @@ def _generate_and_publish_script(id_reporte: str, id_schedule: str, cron_express
             )
         )
 
+    generator: Callable[..., str] = mapping["generator"]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        script_path = generator(id_schedule, output_dir=temp_dir)
+        zip_name = f"{os.path.splitext(os.path.basename(script_path))[0]}.zip"
+        webjob_name = os.path.splitext(os.path.basename(script_path))[0].replace("_", "")
+
+    return {
+        "mapping": mapping,
+        "zipName": zip_name,
+        "webjobName": webjob_name,
+    }
+
+
+def _sanitize_metadata_value(value: str, max_len: int = 512) -> str:
+    clean = " ".join(str(value).replace("\n", " ").replace("\r", " ").split())
+    return clean[:max_len]
+
+
+def _generate_and_publish_script(id_reporte: str, id_schedule: str, cron_expression: str) -> Dict[str, Any]:
+    artifact_names = _get_artifact_names(id_reporte=id_reporte, id_schedule=id_schedule)
+    mapping = artifact_names["mapping"]
     generator: Callable[..., str] = mapping["generator"]
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -258,11 +328,15 @@ def _generate_and_publish_script(id_reporte: str, id_schedule: str, cron_express
 
 
 def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_message: str) -> func.HttpResponse:
+    operation_id = str(uuid.uuid4())
+
     if req.method != expected_method:
+        _trace_log(operation_id, "create_or_update", "method_not_allowed", expectedMethod=expected_method, currentMethod=req.method)
         return func.HttpResponse(
             json.dumps(
                 {
                     "ok": False,
+                    "operationId": operation_id,
                     "message": f"Metodo no permitido. Usa {expected_method}.",
                 }
             ),
@@ -273,12 +347,15 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
     id_reporte = _get_request_param(req, "idReporte")
     id_schedule = _get_request_param(req, "idSchedule")
     cron_expression = _normalize_webjob_cron(_get_request_param(req, "cron"))
+    _trace_log(operation_id, "create_or_update", "started", method=expected_method, idReporte=id_reporte, idSchedule=id_schedule)
 
     if not id_reporte:
+        _trace_log(operation_id, "create_or_update", "validation_error", field="idReporte")
         return func.HttpResponse(
             json.dumps(
                 {
                     "ok": False,
+                    "operationId": operation_id,
                     "message": "El parametro 'idReporte' es requerido en el body JSON.",
                 }
             ),
@@ -287,10 +364,12 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
         )
 
     if not id_schedule:
+        _trace_log(operation_id, "create_or_update", "validation_error", field="idSchedule")
         return func.HttpResponse(
             json.dumps(
                 {
                     "ok": False,
+                    "operationId": operation_id,
                     "message": "El parametro 'idSchedule' es requerido en el body JSON.",
                 }
             ),
@@ -299,10 +378,12 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
         )
 
     if not cron_expression:
+        _trace_log(operation_id, "create_or_update", "validation_error", field="cron")
         return func.HttpResponse(
             json.dumps(
                 {
                     "ok": False,
+                    "operationId": operation_id,
                     "message": "El parametro 'cron' es requerido en el body JSON.",
                 }
             ),
@@ -311,10 +392,12 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
         )
 
     if not _is_valid_webjob_cron(cron_expression):
+        _trace_log(operation_id, "create_or_update", "validation_error", field="cron", reason="invalid_webjob_cron")
         return func.HttpResponse(
             json.dumps(
                 {
                     "ok": False,
+                    "operationId": operation_id,
                     "message": "El parametro 'cron' debe tener 6 campos para WebJobs.",
                     "cron": cron_expression,
                 }
@@ -324,15 +407,19 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
         )
 
     try:
+        _trace_log(operation_id, "create_or_update", "publishing_started")
         result = _generate_and_publish_script(
             id_reporte=id_reporte,
             id_schedule=id_schedule,
             cron_expression=cron_expression,
         )
+        _trace_log(operation_id, "create_or_update", "publishing_completed", webjobName=result["webjobName"], blobName=result["blob"]["blobName"])
     except RuntimeError as runtime_exc:
+        _trace_log(operation_id, "create_or_update", "webjob_deploy_error", error=str(runtime_exc))
         payload = str(runtime_exc)
         return func.HttpResponse(payload, status_code=502, mimetype="application/json")
     except ValueError as value_exc:
+        _trace_log(operation_id, "create_or_update", "validation_error", error=str(value_exc))
         payload = str(value_exc)
         try:
             json.loads(payload)
@@ -342,6 +429,7 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
                 json.dumps(
                     {
                         "ok": False,
+                        "operationId": operation_id,
                         "message": "Error de validacion.",
                         "error": payload,
                     }
@@ -351,10 +439,12 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
             )
     except Exception as exc:
         logging.exception("Error creating/updating script.")
+        _trace_log(operation_id, "create_or_update", "unexpected_error", error=str(exc))
         return func.HttpResponse(
             json.dumps(
                 {
                     "ok": False,
+                    "operationId": operation_id,
                     "message": "Error al generar script.",
                     "error": str(exc),
                 }
@@ -367,6 +457,7 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
         body=json.dumps(
             {
                 "ok": True,
+                "operationId": operation_id,
                 "idReporte": id_reporte,
                 "idSchedule": id_schedule,
                 "scriptType": result["mapping"]["name"],
@@ -382,6 +473,186 @@ def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_
         status_code=200,
         mimetype="application/json",
     )
+
+
+def _delete_webjob(job_name: str) -> Dict[str, Any]:
+    deploy_enabled = os.getenv("WEBJOB_DEPLOY_ENABLED", "false").strip().lower() == "true"
+    if not deploy_enabled:
+        return {
+            "status": "skipped",
+            "reason": "WEBJOB_DEPLOY_ENABLED=false",
+            "jobName": job_name,
+        }
+
+    app_name = os.getenv("WEBJOB_APP_NAME", "").strip()
+    scm_user = os.getenv("WEBJOB_SCM_USER", "").strip()
+    scm_password = os.getenv("WEBJOB_SCM_PASSWORD", "").strip()
+    if not app_name or not scm_user or not scm_password:
+        raise ValueError(
+            "Faltan variables WEBJOB_APP_NAME, WEBJOB_SCM_USER o WEBJOB_SCM_PASSWORD para eliminar el WebJob."
+        )
+
+    kudu_url = f"https://{app_name}.scm.azurewebsites.net/api/triggeredwebjobs/{job_name}"
+    response = requests.delete(kudu_url, auth=(scm_user, scm_password), timeout=60)
+
+    if response.status_code == 404:
+        return {
+            "status": "not_found",
+            "jobName": job_name,
+            "kuduUrl": kudu_url,
+            "statusCode": response.status_code,
+        }
+
+    if not response.ok:
+        raise ValueError(
+            f"Error Kudu {response.status_code} al eliminar {job_name}: {response.text}"
+        )
+
+    payload: Dict[str, Any] = {
+        "status": "deleted",
+        "jobName": job_name,
+        "kuduUrl": kudu_url,
+        "statusCode": response.status_code,
+    }
+
+    try:
+        payload["response"] = response.json()
+    except ValueError:
+        payload["responseText"] = response.text
+
+    return payload
+
+
+def _execute_graphs_versus_delete(req: func.HttpRequest) -> func.HttpResponse:
+    operation_id = str(uuid.uuid4())
+
+    if req.method != "DELETE":
+        _trace_log(operation_id, "delete", "method_not_allowed", currentMethod=req.method)
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "operationId": operation_id,
+                    "message": "Metodo no permitido. Usa DELETE.",
+                }
+            ),
+            status_code=405,
+            mimetype="application/json",
+        )
+
+    id_reporte = _get_request_param(req, "idReporte")
+    id_schedule = _get_request_param(req, "idSchedule")
+    _trace_log(operation_id, "delete", "started", idReporte=id_reporte, idSchedule=id_schedule)
+
+    if not id_reporte:
+        _trace_log(operation_id, "delete", "validation_error", field="idReporte")
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "operationId": operation_id,
+                    "message": "El parametro 'idReporte' es requerido en el body JSON.",
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    if not id_schedule:
+        _trace_log(operation_id, "delete", "validation_error", field="idSchedule")
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "operationId": operation_id,
+                    "message": "El parametro 'idSchedule' es requerido en el body JSON.",
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        artifact_names = _get_artifact_names(id_reporte=id_reporte, id_schedule=id_schedule)
+        mapping = artifact_names["mapping"]
+        webjob_name = artifact_names["webjobName"]
+
+        blob_info = _find_blob_by_schedule(mapping["code"], id_reporte, id_schedule)
+        if blob_info:
+            metadata = blob_info.get("metadata", {})
+            webjob_name = metadata.get("webjob_name") or webjob_name
+            blob_delete_result = _delete_blob(blob_info["container"], blob_info["blobName"])
+        else:
+            inferred_blob_name = f"{mapping['code']}/{artifact_names['zipName']}"
+            container_name = os.getenv("SCRIPT_BLOB_CONTAINER", "generated-scripts")
+            blob_delete_result = _delete_blob(container_name, inferred_blob_name)
+
+        _trace_log(
+            operation_id,
+            "delete",
+            "blob_processed",
+            blobStatus=blob_delete_result.get("status"),
+            blobName=blob_delete_result.get("blobName"),
+        )
+
+        webjob_delete_result = _delete_webjob(webjob_name)
+        _trace_log(
+            operation_id,
+            "delete",
+            "webjob_processed",
+            webjobStatus=webjob_delete_result.get("status"),
+            webjobName=webjob_name,
+        )
+
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": True,
+                    "operationId": operation_id,
+                    "idReporte": id_reporte,
+                    "idSchedule": id_schedule,
+                    "blobDelete": blob_delete_result,
+                    "webjobDelete": webjob_delete_result,
+                    "message": "Proceso de eliminacion completado.",
+                }
+            ),
+            status_code=200,
+            mimetype="application/json",
+        )
+    except ValueError as value_exc:
+        _trace_log(operation_id, "delete", "validation_error", error=str(value_exc))
+        payload = str(value_exc)
+        try:
+            json.loads(payload)
+            return func.HttpResponse(payload, status_code=400, mimetype="application/json")
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "operationId": operation_id,
+                        "message": "Error de validacion en delete.",
+                        "error": payload,
+                    }
+                ),
+                status_code=400,
+                mimetype="application/json",
+            )
+    except Exception as exc:
+        logging.exception("Error deleting script artifacts.")
+        _trace_log(operation_id, "delete", "unexpected_error", error=str(exc))
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "operationId": operation_id,
+                    "message": "Error al eliminar artefactos.",
+                    "error": str(exc),
+                }
+            ),
+            status_code=500,
+            mimetype="application/json",
+        )
 
 
 def _deploy_to_webjob(zip_bytes: bytes, job_name: str) -> Optional[Dict[str, Any]]:
@@ -428,8 +699,8 @@ def _deploy_to_webjob(zip_bytes: bytes, job_name: str) -> Optional[Dict[str, Any
     return payload
 
 
-@app.route(route="GraphsVersus", auth_level=func.AuthLevel.FUNCTION)
-def graphs_versus(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="GraphsVersusCreate", auth_level=func.AuthLevel.FUNCTION)
+def graphs_versus_create(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Processing script generation request.")
 
     return _execute_graphs_versus(
@@ -448,3 +719,9 @@ def graphs_versus_update(req: func.HttpRequest) -> func.HttpResponse:
         expected_method="PUT",
         success_message="Script actualizado en Blob Storage y WebJob.",
     )
+
+
+@app.route(route="GraphsVersusDelete", auth_level=func.AuthLevel.FUNCTION)
+def graphs_versus_delete(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("Processing script delete request.")
+    return _execute_graphs_versus_delete(req)
