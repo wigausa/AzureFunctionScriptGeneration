@@ -1,52 +1,5 @@
 #!/usr/bin/env python3
 """
-Generador de scripts GVC para Azure WebJobs
-Versión Python 3.12+ con Azure Functions
-"""
-import sys
-import os
-import logging
-import requests
-from typing import Optional, Dict, Any
-
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
-
-# Constantes
-TOKEN_USERS = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWRtaW53aWdhIiwiaWQiOjI3MCwiZXhwaXJlZERhdGUiOiIyMDE5LTA3LTIyVDExOjAwOjMyLjA2NzU2ODYtMDU6MDAifQ.BXMx2BKIbkJyD_jRrfhY6Sj_SJbo8gWM8wHghzFvrT0"
-BASE_URL = "https://superwicloudapi.azurewebsites.net/api/v1"
-
-def make_request(method: str, url: str, headers: Optional[Dict[str, str]] = None, json_body: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Realiza una petición HTTP y retorna la respuesta JSON."""
-    try:
-        logger.debug(f"Realizando petición {method} a: {url}")
-        response = requests.request(method, url, headers=headers, json=json_body, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logger.error(f"Error en petición {method} {url}: {e}")
-        return None
-
-def get_data_informe(report_id: str) -> Optional[Dict[str, Any]]:
-    """Obtiene los datos del informe desde la API."""
-    url = f"{BASE_URL}/reports/{report_id}"
-    headers = {'Content-Type': 'application/json', 'token': TOKEN_USERS}
-    result = make_request('GET', url, headers=headers)
-    
-    if result and 'configuration' in result:
-        logger.info(f"Configuración del informe {report_id} obtenida exitosamente")
-        return result
-    
-    logger.error(f"No se pudo obtener configuración del informe {report_id}")
-    return None
-
-TEMPLATE = '''#!/usr/bin/env python3
-"""
 Script de generación de reportes GVC para Azure WebJobs
 Versión Python 3.12+ - Generado automáticamente
 Report ID: {report_id}
@@ -288,50 +241,4 @@ def generate_report() -> bool:
 if __name__ == "__main__":
     success = generate_report()
     if not success:
-        sys.exit(1)
-'''
-
-def create_script(report_id: str, output_dir: str = "../GraficaVersus") -> str:
-    """Crea un script GVC personalizado para el report_id especificado."""
-    try:
-        # Obtener datos del informe para generar el nombre del archivo
-        informe_data = get_data_informe(report_id)
-        if not informe_data or 'id' not in informe_data:
-            logger.error(f"No se pudo obtener información del informe {report_id}")
-            file_name = f"GVC_{report_id}.py"
-        else:
-            file_name = f"GVC_{informe_data['id']}.py"
-        
-        os.makedirs(output_dir, exist_ok=True)
-        file_path = os.path.join(output_dir, file_name)
-        
-        # Generar el contenido del script
-        content = TEMPLATE.format(report_id=report_id)
-        
-        # Escribir el archivo
-        with open(file_path, "w", encoding="utf-8") as file:
-            file.write(content)
-        
-        logger.info(f"✅ Script {file_name} generado exitosamente")
-        logger.info(f"📁 Ubicación: {os.path.abspath(file_path)}")
-        return file_path
-        
-    except Exception as e:
-        logger.error(f"Error al crear el script: {e}")
-        raise
-
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        logger.error("Uso: python GVC.py <report_id>")
-        logger.info("Ejemplo: python GVC.py siU0zhZO8M0QFrHE")
-        sys.exit(1)
-    
-    report_id = sys.argv[1]
-    logger.info(f"🚀 Iniciando generación de script GVC para report_id: {report_id}")
-    
-    try:
-        create_script(report_id)
-        logger.info("✅ Proceso completado exitosamente")
-    except Exception as e:
-        logger.error(f"❌ Error durante la generación: {e}")
         sys.exit(1)

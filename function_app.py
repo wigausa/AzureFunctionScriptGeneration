@@ -11,10 +11,10 @@ import requests
 from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_blob_sas
 from azure.core.exceptions import ResourceExistsError
 
-from utils.GV import create_script as create_gv_script
-from utils.GVC import create_script as create_gvc_script
-from utils.GVS import create_script as create_gvs_script
-from utils.RS import create_script as create_rs_script
+from utils.templates.GV import create_script as create_gv_script
+from utils.templates.GVC import create_script as create_gvc_script
+from utils.templates.GVS import create_script as create_gvs_script
+from utils.templates.RS import create_script as create_rs_script
 
 app = func.FunctionApp()
 
@@ -35,14 +35,26 @@ SCRIPT_GENERATORS: Dict[str, Dict[str, Any]] = {
         "generator": create_gv_script,
     },
     "BkL5kC4ww": {
-        "name": "Resumen empresa",
+        "name": "Resumen Empresa",
         "code": "RS",
         "generator": create_rs_script,
     },
 }
 
-def _get_query_param(req: func.HttpRequest, key: str) -> str:
-    return (req.params.get(key) or "").strip()
+def _get_body_param(req: func.HttpRequest, key: str) -> str:
+    try:
+        body = req.get_json()
+    except ValueError:
+        return ""
+
+    if not isinstance(body, dict):
+        return ""
+
+    return str(body.get(key) or "").strip()
+
+
+def _get_request_param(req: func.HttpRequest, key: str) -> str:
+    return _get_body_param(req, key)
 
 
 def _get_blob_connection_string() -> str:
@@ -141,6 +153,237 @@ def _sanitize_metadata_value(value: str, max_len: int = 512) -> str:
     return clean[:max_len]
 
 
+def _generate_and_publish_script(id_reporte: str, id_schedule: str, cron_expression: str) -> Dict[str, Any]:
+    mapping = SCRIPT_GENERATORS.get(id_reporte)
+    if not mapping:
+        raise ValueError(
+            json.dumps(
+                {
+                    "ok": False,
+                    "message": f"idReporte no soportado: {id_reporte}",
+                    "supported": list(SCRIPT_GENERATORS.keys()),
+                }
+            )
+        )
+
+    generator: Callable[..., str] = mapping["generator"]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        script_path = generator(id_schedule, output_dir=temp_dir)
+        zip_bytes = _build_webjob_zip_bytes(script_path, cron_expression)
+        zip_name = f"{os.path.splitext(os.path.basename(script_path))[0]}.zip"
+        webjob_name = os.path.splitext(os.path.basename(script_path))[0].replace("_", "")
+        deploy_zip_bytes = _build_webjob_deploy_zip_bytes(script_path, cron_expression)
+        flow_mode = os.getenv("WEBJOB_FLOW_MODE", "blob_first_with_status").strip().lower()
+
+        if flow_mode == "deploy_first":
+            webjob_deploy_info = _deploy_to_webjob(deploy_zip_bytes, webjob_name)
+            blob_info = _upload_zip_to_blob(zip_bytes, zip_name, mapping["code"])
+            _set_blob_metadata(
+                container_name=blob_info["container"],
+                blob_name=blob_info["blobName"],
+                metadata={
+                    "deploy_status": "success",
+                    "webjob_name": webjob_name,
+                    "flow_mode": flow_mode,
+                    "id_reporte": id_reporte,
+                    "id_schedule": id_schedule,
+                    "cron": _sanitize_metadata_value(cron_expression, 64),
+                    "deployed_at_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        elif flow_mode == "blob_first_with_status":
+            blob_info = _upload_zip_to_blob(zip_bytes, zip_name, mapping["code"])
+            try:
+                webjob_deploy_info = _deploy_to_webjob(deploy_zip_bytes, webjob_name)
+                _set_blob_metadata(
+                    container_name=blob_info["container"],
+                    blob_name=blob_info["blobName"],
+                    metadata={
+                        "deploy_status": "success",
+                        "webjob_name": webjob_name,
+                        "flow_mode": flow_mode,
+                        "id_reporte": id_reporte,
+                        "id_schedule": id_schedule,
+                        "cron": _sanitize_metadata_value(cron_expression, 64),
+                        "deployed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            except Exception as deploy_exc:
+                _set_blob_metadata(
+                    container_name=blob_info["container"],
+                    blob_name=blob_info["blobName"],
+                    metadata={
+                        "deploy_status": "failed",
+                        "webjob_name": webjob_name,
+                        "flow_mode": flow_mode,
+                        "id_reporte": id_reporte,
+                        "id_schedule": id_schedule,
+                        "cron": _sanitize_metadata_value(cron_expression, 64),
+                        "deploy_error": _sanitize_metadata_value(str(deploy_exc)),
+                        "failed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                raise RuntimeError(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "message": "Error al desplegar WebJob. El zip se guardo en Blob con estado failed.",
+                            "error": str(deploy_exc),
+                            "flowMode": flow_mode,
+                            "blob": blob_info,
+                            "webjobName": webjob_name,
+                        }
+                    )
+                )
+        else:
+            raise ValueError(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "message": "Valor invalido en WEBJOB_FLOW_MODE. Usa deploy_first o blob_first_with_status.",
+                        "flowMode": flow_mode,
+                    }
+                )
+            )
+
+    return {
+        "mapping": mapping,
+        "zipName": zip_name,
+        "webjobName": webjob_name,
+        "flowMode": flow_mode,
+        "blob": blob_info,
+        "webjobDeploy": webjob_deploy_info,
+    }
+
+
+def _execute_graphs_versus(req: func.HttpRequest, expected_method: str, success_message: str) -> func.HttpResponse:
+    if req.method != expected_method:
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "message": f"Metodo no permitido. Usa {expected_method}.",
+                }
+            ),
+            status_code=405,
+            mimetype="application/json",
+        )
+
+    id_reporte = _get_request_param(req, "idReporte")
+    id_schedule = _get_request_param(req, "idSchedule")
+    cron_expression = _normalize_webjob_cron(_get_request_param(req, "cron"))
+
+    if not id_reporte:
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "message": "El parametro 'idReporte' es requerido en el body JSON.",
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    if not id_schedule:
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "message": "El parametro 'idSchedule' es requerido en el body JSON.",
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    if not cron_expression:
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "message": "El parametro 'cron' es requerido en el body JSON.",
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    if not _is_valid_webjob_cron(cron_expression):
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "message": "El parametro 'cron' debe tener 6 campos para WebJobs.",
+                    "cron": cron_expression,
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        result = _generate_and_publish_script(
+            id_reporte=id_reporte,
+            id_schedule=id_schedule,
+            cron_expression=cron_expression,
+        )
+    except RuntimeError as runtime_exc:
+        payload = str(runtime_exc)
+        return func.HttpResponse(payload, status_code=502, mimetype="application/json")
+    except ValueError as value_exc:
+        payload = str(value_exc)
+        try:
+            json.loads(payload)
+            return func.HttpResponse(payload, status_code=400, mimetype="application/json")
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "message": "Error de validacion.",
+                        "error": payload,
+                    }
+                ),
+                status_code=400,
+                mimetype="application/json",
+            )
+    except Exception as exc:
+        logging.exception("Error creating/updating script.")
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "ok": False,
+                    "message": "Error al generar script.",
+                    "error": str(exc),
+                }
+            ),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        body=json.dumps(
+            {
+                "ok": True,
+                "idReporte": id_reporte,
+                "idSchedule": id_schedule,
+                "scriptType": result["mapping"]["name"],
+                "zipFileName": result["zipName"],
+                "cron": cron_expression,
+                "webjobName": result["webjobName"],
+                "flowMode": result["flowMode"],
+                "blob": result["blob"],
+                "webjobDeploy": result["webjobDeploy"],
+                "message": success_message,
+            }
+        ),
+        status_code=200,
+        mimetype="application/json",
+    )
+
+
 def _deploy_to_webjob(zip_bytes: bytes, job_name: str) -> Optional[Dict[str, Any]]:
     deploy_enabled = os.getenv("WEBJOB_DEPLOY_ENABLED", "false").strip().lower() == "true"
     if not deploy_enabled:
@@ -189,199 +432,19 @@ def _deploy_to_webjob(zip_bytes: bytes, job_name: str) -> Optional[Dict[str, Any
 def graphs_versus(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Processing script generation request.")
 
-    if req.method != "GET":
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "ok": False,
-                    "message": "Metodo no permitido. Usa GET.",
-                }
-            ),
-            status_code=405,
-            mimetype="application/json",
-        )
+    return _execute_graphs_versus(
+        req=req,
+        expected_method="POST",
+        success_message="Script generado y cargado en Blob Storage.",
+    )
 
-    id_reporte = _get_query_param(req, "idReporte")
-    id_schedule = _get_query_param(req, "idSchedule")
-    cron_expression = _normalize_webjob_cron(_get_query_param(req, "cron"))
-    if not id_reporte:
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "ok": False,
-                    "message": "El parametro 'idReporte' es requerido.",
-                }
-            ),
-            status_code=400,
-            mimetype="application/json",
-        )
 
-    if not id_schedule:
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "ok": False,
-                    "message": "El parametro 'idSchedule' es requerido.",
-                }
-            ),
-            status_code=400,
-            mimetype="application/json",
-        )
+@app.route(route="GraphsVersusUpdate", auth_level=func.AuthLevel.FUNCTION)
+def graphs_versus_update(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("Processing script update request.")
 
-    if not cron_expression:
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "ok": False,
-                    "message": "El parametro 'cron' es requerido.",
-                }
-            ),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    if not _is_valid_webjob_cron(cron_expression):
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "ok": False,
-                    "message": "El parametro 'cron' debe tener 6 campos para WebJobs.",
-                    "cron": cron_expression,
-                }
-            ),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    mapping = SCRIPT_GENERATORS.get(id_reporte)
-    if not mapping:
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "ok": False,
-                    "message": f"idReporte no soportado: {id_reporte}",
-                    "supported": list(SCRIPT_GENERATORS.keys()),
-                }
-            ),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    generator: Callable[..., str] = mapping["generator"]
-
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_path = generator(id_schedule, output_dir=temp_dir)
-            zip_bytes = _build_webjob_zip_bytes(script_path, cron_expression)
-            zip_name = f"{os.path.splitext(os.path.basename(script_path))[0]}.zip"
-            webjob_name = os.path.splitext(os.path.basename(script_path))[0].replace("_", "")
-            deploy_zip_bytes = _build_webjob_deploy_zip_bytes(script_path, cron_expression)
-            flow_mode = os.getenv("WEBJOB_FLOW_MODE", "blob_first_with_status").strip().lower()
-
-            if flow_mode == "deploy_first":
-                webjob_deploy_info = _deploy_to_webjob(deploy_zip_bytes, webjob_name)
-                blob_info = _upload_zip_to_blob(zip_bytes, zip_name, mapping["code"])
-                _set_blob_metadata(
-                    container_name=blob_info["container"],
-                    blob_name=blob_info["blobName"],
-                    metadata={
-                        "deploy_status": "success",
-                        "webjob_name": webjob_name,
-                        "flow_mode": flow_mode,
-                        "id_reporte": id_reporte,
-                        "id_schedule": id_schedule,
-                        "cron": _sanitize_metadata_value(cron_expression, 64),
-                        "deployed_at_utc": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-            elif flow_mode == "blob_first_with_status":
-                blob_info = _upload_zip_to_blob(zip_bytes, zip_name, mapping["code"])
-                try:
-                    webjob_deploy_info = _deploy_to_webjob(deploy_zip_bytes, webjob_name)
-                    _set_blob_metadata(
-                        container_name=blob_info["container"],
-                        blob_name=blob_info["blobName"],
-                        metadata={
-                            "deploy_status": "success",
-                            "webjob_name": webjob_name,
-                            "flow_mode": flow_mode,
-                            "id_reporte": id_reporte,
-                            "id_schedule": id_schedule,
-                            "cron": _sanitize_metadata_value(cron_expression, 64),
-                            "deployed_at_utc": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
-                except Exception as deploy_exc:
-                    _set_blob_metadata(
-                        container_name=blob_info["container"],
-                        blob_name=blob_info["blobName"],
-                        metadata={
-                            "deploy_status": "failed",
-                            "webjob_name": webjob_name,
-                            "flow_mode": flow_mode,
-                            "id_reporte": id_reporte,
-                            "id_schedule": id_schedule,
-                            "cron": _sanitize_metadata_value(cron_expression, 64),
-                            "deploy_error": _sanitize_metadata_value(str(deploy_exc)),
-                            "failed_at_utc": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
-                    return func.HttpResponse(
-                        body=json.dumps(
-                            {
-                                "ok": False,
-                                "message": "Error al desplegar WebJob. El zip se guardo en Blob con estado failed.",
-                                "error": str(deploy_exc),
-                                "flowMode": flow_mode,
-                                "blob": blob_info,
-                                "webjobName": webjob_name,
-                            }
-                        ),
-                        status_code=502,
-                        mimetype="application/json",
-                    )
-            else:
-                return func.HttpResponse(
-                    body=json.dumps(
-                        {
-                            "ok": False,
-                            "message": "Valor invalido en WEBJOB_FLOW_MODE. Usa deploy_first o blob_first_with_status.",
-                            "flowMode": flow_mode,
-                        }
-                    ),
-                    status_code=500,
-                    mimetype="application/json",
-                )
-    except Exception as exc:
-        logging.exception("Error creating script.")
-        return func.HttpResponse(
-            json.dumps(
-                {
-                    "ok": False,
-                    "message": "Error al generar script.",
-                    "error": str(exc),
-                }
-            ),
-            status_code=500,
-            mimetype="application/json",
-        )
-
-    return func.HttpResponse(
-        body=json.dumps(
-            {
-                "ok": True,
-                "idReporte": id_reporte,
-                "idSchedule": id_schedule,
-                "scriptType": mapping["name"],
-                "zipFileName": zip_name,
-                "cron": cron_expression,
-                "webjobName": webjob_name,
-                "flowMode": flow_mode,
-                "blob": blob_info,
-                "webjobDeploy": webjob_deploy_info,
-                "message": "Script generado y cargado en Blob Storage.",
-            }
-        ),
-        status_code=200,
-        mimetype="application/json",
+    return _execute_graphs_versus(
+        req=req,
+        expected_method="PUT",
+        success_message="Script actualizado en Blob Storage y WebJob.",
     )

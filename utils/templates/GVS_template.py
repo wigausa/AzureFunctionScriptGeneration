@@ -1,53 +1,6 @@
 #!/usr/bin/env python3
 """
-Generador de scripts GV para Azure WebJobs
-Versión Python 3.12+ con Azure Functions
-"""
-import sys
-import os
-import logging
-import requests
-from typing import Optional, Dict, Any
-
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
-
-# Constantes
-TOKEN_USERS = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWRtaW53aWdhIiwiaWQiOjI3MCwiZXhwaXJlZERhdGUiOiIyMDE5LTA3LTIyVDExOjAwOjMyLjA2NzU2ODYtMDU6MDAifQ.BXMx2BKIbkJyD_jRrfhY6Sj_SJbo8gWM8wHghzFvrT0"
-BASE_URL = "https://superwicloudapi.azurewebsites.net/api/v1"
-
-def make_request(method: str, url: str, headers: Optional[Dict[str, str]] = None, json_body: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Realiza una petición HTTP y retorna la respuesta JSON."""
-    try:
-        logger.debug(f"Realizando petición {method} a: {url}")
-        response = requests.request(method, url, headers=headers, json=json_body, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logger.error(f"Error en petición {method} {url}: {e}")
-        return None
-
-def get_data_informe(report_id: str) -> Optional[Dict[str, Any]]:
-    """Obtiene los datos del informe desde la API."""
-    url = f"{BASE_URL}/reports/{report_id}"
-    headers = {'Content-Type': 'application/json', 'token': TOKEN_USERS}
-    result = make_request('GET', url, headers=headers)
-    
-    if result and 'configuration' in result:
-        logger.info(f"Configuración del informe {report_id} obtenida exitosamente")
-        return result
-    
-    logger.error(f"No se pudo obtener configuración del informe {report_id}")
-    return None
-
-TEMPLATE = '''#!/usr/bin/env python3
-"""
-Script de generación de reportes GV para Azure WebJobs
+Script de generación de reportes GVS (mensuales) para Azure WebJobs
 Versión Python 3.12+ - Generado automáticamente
 Report ID: {report_id}
 """
@@ -162,9 +115,8 @@ logger = logging.getLogger(__name__)
 
 # Constantes
 TOKEN_USERS = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWRtaW53aWdhIiwiaWQiOjI3MCwiZXhwaXJlZERhdGUiOiIyMDE5LTA3LTIyVDExOjAwOjMyLjA2NzU2ODYtMDU6MDAifQ.BXMx2BKIbkJyD_jRrfhY6Sj_SJbo8gWM8wHghzFvrT0"
-BASE_URL_V1 = "https://superwicloudapi.azurewebsites.net/api/v1"
-BASE_URL = "https://superwicloudapi.azurewebsites.net/api"
-AZURE_FUNCTION_URL = os.getenv("AZURE_FUNCTION_GV_URL", "http://localhost:7071/api/GV")
+BASE_URL = "https://superwicloudapi.azurewebsites.net/api/v1"
+AZURE_FUNCTION_URL = os.getenv("AZURE_FUNCTION_GVS_URL", "http://localhost:7071/api/GVS")
 
 def make_request(method: str, url: str, headers: Optional[Dict[str, str]] = None, json_body: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Realiza una petición HTTP y retorna la respuesta JSON."""
@@ -178,28 +130,28 @@ def make_request(method: str, url: str, headers: Optional[Dict[str, str]] = None
         return None
     
 def get_data_informe() -> Optional[Dict[str, Any]]:
-    """Obtiene los datos del informe GV desde la API."""
-    url = f"{{BASE_URL_V1}}/reports/{report_id}"
+    """Obtiene los datos del informe GVS desde la API."""
+    url = f"{{BASE_URL}}/reports/{report_id}"
     headers = {{'Content-Type': 'application/json', 'token': TOKEN_USERS}}
     result = make_request('GET', url, headers=headers)
     
     if result and 'configuration' in result:
-        logger.info("Configuración del informe GV obtenida exitosamente")
+        logger.info("Configuración del informe GVS obtenida exitosamente")
         return result
     
-    logger.error("No se pudo obtener configuración del informe GV")
+    logger.error("No se pudo obtener configuración del informe GVS")
     return None
 
 def get_reportes_graficos() -> Optional[Dict[str, Any]]:
-    """Obtiene los reportes gráficos desde la API."""
+    """Obtiene los reportes gráficos mensuales desde la API."""
     informe = get_data_informe()
     if not informe:
         return None
     
     try:
         config = informe['configuration']
-        # Nota: Endpoint específico para TableReport (sin v1)
-        url = f"{{BASE_URL}}/TableReport"
+        # Nota: Endpoint específico para reportes mensuales
+        url = f"{{BASE_URL}}/reports/multipleTableMensualReport"
         headers = {{'token': config['token']}}
         body = {{
             "sensorsId": config['sensores'],
@@ -209,21 +161,14 @@ def get_reportes_graficos() -> Optional[Dict[str, Any]]:
             "configurationSendingData": informe['configurationSendingData']
         }}
         
-        logger.info(f"Obteniendo reportes gráficos para período: {{body['startDate']}} - {{body['endDate']}}")
-        result = make_request('POST', url, headers=headers, json_body=body)
-        
-        if result:
-            logger.info("Datos de gráficos obtenidos exitosamente")
-            return result
-        
-        logger.error("No se pudieron obtener datos de gráficos")
-        return None
+        logger.info(f"Obteniendo reportes mensuales para período: {{body['startDate']}} - {{body['endDate']}}")
+        return make_request('POST', url, headers=headers, json_body=body)
     except KeyError as e:
-        logger.error(f"Falta configuración GV: {{e}}")
+        logger.error(f"Falta configuración GVS: {{e}}")
         return None
 
 def get_stats() -> Optional[Dict[str, Any]]:
-    """Obtiene las estadísticas desde la API."""
+    """Obtiene las estadísticas GVS desde la API."""
     informe = get_data_informe()
     if not informe:
         return None
@@ -232,24 +177,17 @@ def get_stats() -> Optional[Dict[str, Any]]:
         config = informe['configuration']
         fecha_inicial = config['fechas']['fechaInicial']
         fecha_final = config['fechas']['fechaFinal']
-        url = f"{{BASE_URL_V1}}/reports/stats/{{fecha_inicial}}/{{fecha_final}}"
+        url = f"{{BASE_URL}}/reports/stats/{{fecha_inicial}}/{{fecha_final}}"
         headers = {{'token': config['token']}}
         
-        logger.info(f"Obteniendo estadísticas GV para período: {{fecha_inicial}} - {{fecha_final}}")
-        result = make_request('POST', url, headers=headers, json_body=config['sensores'])
-        
-        if result:
-            logger.info("Estadísticas obtenidas exitosamente")
-            return result
-        
-        logger.error("No se pudieron obtener estadísticas")
-        return None
+        logger.info(f"Obteniendo estadísticas GVS para período: {{fecha_inicial}} - {{fecha_final}}")
+        return make_request('POST', url, headers=headers, json_body=config['sensores'])
     except KeyError as e:
-        logger.error(f"Falta configuración GV: {{e}}")
+        logger.error(f"Falta configuración GVS: {{e}}")
         return None
 
 def send_to_azure_function(stats: Any, versus: Any, datos_usuario: Any) -> Optional[bytes]:
-    """Envía los datos a la Azure Function GV y retorna el contenido de la respuesta."""
+    """Envía los datos a la Azure Function GVS y retorna el contenido de la respuesta."""
     payload = {{
         "stats": stats,
         "versus": versus,
@@ -257,18 +195,18 @@ def send_to_azure_function(stats: Any, versus: Any, datos_usuario: Any) -> Optio
     }}
     
     try:
-        logger.info("Enviando datos a Azure Function GV...")
+        logger.info("Enviando datos a Azure Function GVS...")
         response = requests.post(AZURE_FUNCTION_URL, json=payload, timeout=60)
         response.raise_for_status()
-        logger.info("Datos enviados correctamente a Azure Function GV")
+        logger.info("Datos enviados correctamente a Azure Function GVS")
         return response.content
     except requests.RequestException as e:
-        logger.error(f"Error al enviar datos a Azure Function GV: {{e}}")
+        logger.error(f"Error al enviar datos a Azure Function GVS: {{e}}")
         return None
 
 def generate_report() -> bool:
-    """Función principal para generar el reporte GV."""
-    logger.info("=== Iniciando generación de reporte GV ===")
+    """Función principal para generar el reporte GVS."""
+    logger.info("=== Iniciando generación de reporte GVS (mensual) ===")
     
     try:
         # Obtener todos los datos necesarios
@@ -278,75 +216,29 @@ def generate_report() -> bool:
         
         # Validar que tengamos al menos algunos datos
         if not any([stats, versus, datos_usuario]):
-            logger.error("No se pudo obtener ningún dato para el reporte GV")
+            logger.error("No se pudo obtener ningún dato para el reporte GVS")
             return False
         
         # Mostrar resumen de datos obtenidos
         logger.info(f"Datos obtenidos - Stats: {{'✓' if stats else '✗'}}, "
-                   f"Gráficos: {{'✓' if versus else '✗'}}, "
+                   f"Gráficos mensuales: {{'✓' if versus else '✗'}}, "
                    f"Usuario: {{'✓' if datos_usuario else '✗'}}")
         
         # Enviar a Azure Function
         pdf_data = send_to_azure_function(stats, versus, datos_usuario)
         
         if pdf_data:
-            logger.info("=== Reporte GV generado exitosamente ===")
+            logger.info("=== Reporte GVS generado exitosamente ===")
             return True
         else:
-            logger.error("Error al generar el reporte GV")
+            logger.error("Error al generar el reporte GVS")
             return False
             
     except Exception as e:
-        logger.error(f"Error inesperado durante la generación del reporte GV: {{e}}")
+        logger.error(f"Error inesperado durante la generación del reporte GVS: {{e}}")
         return False
 
 if __name__ == "__main__":
     success = generate_report()
     if not success:
-        sys.exit(1)
-'''
-
-def create_script(report_id: str, output_dir: str = "../GraficaVersus") -> str:
-    """Crea un script GV personalizado para el report_id especificado."""
-    try:
-        # Obtener datos del informe para generar el nombre del archivo
-        informe_data = get_data_informe(report_id)
-        if not informe_data or 'id' not in informe_data:
-            logger.error(f"No se pudo obtener información del informe {report_id}")
-            file_name = f"GV_{report_id}.py"
-        else:
-            file_name = f"GV_{informe_data['id']}.py"
-        
-        os.makedirs(output_dir, exist_ok=True)
-        file_path = os.path.join(output_dir, file_name)
-        
-        # Generar el contenido del script
-        content = TEMPLATE.format(report_id=report_id)
-        
-        # Escribir el archivo
-        with open(file_path, "w", encoding="utf-8") as file:
-            file.write(content)
-        
-        logger.info(f"✅ Script {file_name} generado exitosamente")
-        logger.info(f"📁 Ubicación: {os.path.abspath(file_path)}")
-        return file_path
-        
-    except Exception as e:
-        logger.error(f"Error al crear el script: {e}")
-        raise
-
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        logger.error("Uso: python GV.py <report_id>")
-        logger.info("Ejemplo: python GV.py Db05ARa75ljZ9cDS")
-        sys.exit(1)
-    
-    report_id = sys.argv[1]
-    logger.info(f"🚀 Iniciando generación de script GV para report_id: {report_id}")
-    
-    try:
-        create_script(report_id)
-        logger.info("✅ Proceso completado exitosamente")
-    except Exception as e:
-        logger.error(f"❌ Error durante la generación: {e}")
         sys.exit(1)
