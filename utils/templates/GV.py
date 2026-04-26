@@ -19,8 +19,15 @@ def create_script(report_id: str, output_dir: str = "../GraficaVersus") -> str:
         report_id=report_id,
         output_dir=output_dir,
         prefix="GV",
-        template_name="GV_template.py",
+        template_name="VERSUS_template.py",
         logger=logger,
+        template_vars={
+            "report_code": "GV",
+            "function_env_var": "AZURE_FUNCTION_GV_URL",
+            "function_default_url": "http://localhost:7071/api/GV",
+            "reportes_endpoint_path": "TableReport",
+            "reportes_label": "reportes gráficos",
+        },
     )
 
 
