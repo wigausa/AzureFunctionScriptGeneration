@@ -1,7 +1,5 @@
 import json
-import os
-import tempfile
-from typing import Any, Callable, Dict
+from typing import Any, Dict
 
 
 def get_artifact_names(
@@ -21,11 +19,10 @@ def get_artifact_names(
             )
         )
 
-    generator: Callable[..., str] = mapping["generator"]
-    with tempfile.TemporaryDirectory() as temp_dir:
-        script_path = generator(id_schedule, output_dir=temp_dir)
-        zip_name = f"{os.path.splitext(os.path.basename(script_path))[0]}.zip"
-        webjob_name = os.path.splitext(os.path.basename(script_path))[0].replace("_", "")
+    code = mapping["code"]
+    base_name = f"{code}_{id_schedule}"
+    zip_name = f"{base_name}.zip"
+    webjob_name = base_name.replace("_", "")
 
     return {
         "mapping": mapping,

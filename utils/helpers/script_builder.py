@@ -2,7 +2,6 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
-from utils.helpers.report_api import get_data_informe
 from utils.helpers.template_loader import load_template
 
 
@@ -14,11 +13,7 @@ def build_script_from_template(
     logger: logging.Logger,
     template_vars: Optional[Dict[str, Any]] = None,
 ) -> str:
-    informe_data = get_data_informe(report_id, logger=logger)
-    if not informe_data or "id" not in informe_data:
-        file_name = f"{prefix}_{report_id}.py"
-    else:
-        file_name = f"{prefix}_{informe_data['id']}.py"
+    file_name = f"{prefix}_{report_id}.py"
 
     os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, file_name)
