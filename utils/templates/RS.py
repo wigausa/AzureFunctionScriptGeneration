@@ -19,7 +19,7 @@ def create_script(report_id: str, output_dir: str = "../GraficaVersus") -> str:
         report_id=report_id,
         output_dir=output_dir,
         prefix="RS",
-        template_name="VERSUS_template.py",
+        template_name="RS_template.py",
         logger=logger,
         template_vars={
             "report_code": "RS",
